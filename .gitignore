@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.egg
+
+# ROS2
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Docker
+.docker/
+
+# Ansible
+*.retry
+ansible/inventory/local
+
+# SSH keys (never commit)
+*.pem
+*.key
+~/.ssh/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local notes (not for repo)
+INTERVIEW_GUIDE.md

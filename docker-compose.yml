@@ -1,0 +1,80 @@
+version: '3.8'
+
+# Simulates a fleet of inspection robots locally.
+# Each service represents one robot running the same Docker image.
+
+services:
+  robot-1:
+    image: robot-fleet:latest
+    container_name: robot-1
+    hostname: robot-1
+    environment:
+      - ROS_DOMAIN_ID=0
+      - ROBOT_ID=robot-1
+      - ROBOT_LOCATION=site-alpha
+    networks:
+      - robot-network
+    restart: unless-stopped
+    command: ros2 run robot_health health_publisher
+
+  robot-2:
+    image: robot-fleet:latest
+    container_name: robot-2
+    hostname: robot-2
+    environment:
+      - ROS_DOMAIN_ID=0
+      - ROBOT_ID=robot-2
+      - ROBOT_LOCATION=site-beta
+    networks:
+      - robot-network
+    restart: unless-stopped
+    command: ros2 run robot_health health_publisher
+
+  robot-3:
+    image: robot-fleet:latest
+    container_name: robot-3
+    hostname: robot-3
+    environment:
+      - ROS_DOMAIN_ID=0
+      - ROBOT_ID=robot-3
+      - ROBOT_LOCATION=site-gamma
+    networks:
+      - robot-network
+    restart: unless-stopped
+    command: ros2 run robot_health health_publisher
+
+  fleet-monitor:
+    image: robot-fleet:latest
+    container_name: fleet-monitor
+    hostname: fleet-monitor
+    environment:
+      - ROS_DOMAIN_ID=0
+    networks:
+      - robot-network
+    restart: unless-stopped
+    command: ros2 run robot_health health_monitor
+    depends_on:
+      - robot-1
+      - robot-2
+      - robot-3
+
+  # Uncomment to add monitoring stack:
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
+  #   networks:
+  #     - robot-network
+  #
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   ports:
+  #     - "3000:3000"
+  #   networks:
+  #     - robot-network
+
+networks:
+  robot-network:
+    driver: bridge

@@ -1,0 +1,43 @@
+# Docker Ignore File
+# Excludes files from Docker build context to speed up builds
+
+# Git files
+.git
+.gitignore
+
+# Documentation
+README.md
+docs/
+
+# Build artifacts (will be built inside container)
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ansible (not needed in Docker image)
+ansible/
+
+# GitHub Actions (not needed in Docker image)
+.github/

@@ -1,0 +1,239 @@
+---
+# Robot Software Deployment Playbook
+#
+# Deploys a new Docker image to the robot fleet with pre-flight checks,
+# backup, health validation, and automatic rollback on failure.
+#
+# Usage:
+#   ansible-playbook -i inventory/production deploy-robot.yml
+#   ansible-playbook -i inventory/staging deploy-robot.yml --limit staging-robot-1
+#   ansible-playbook -i inventory/production deploy-robot.yml --extra-vars "image_tag=v2.1.0"
+
+- name: Deploy Robot Software Update
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    image_tag: "latest"
+    docker_image: "{{ docker_registry }}/robot-fleet:{{ image_tag }}"
+    rollback_enabled: true
+    health_check_timeout: 300
+
+  tasks:
+    # ---- Pre-deployment checks -----------------------------------------------
+
+    - name: Check robot connectivity
+      ping:
+      register: ping_result
+      failed_when: ping_result is failed
+
+    - name: Gather robot facts
+      setup:
+
+    - name: Check disk space (minimum 5GB free)
+      assert:
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first > 5000000000
+        fail_msg: "Insufficient disk space on {{ inventory_hostname }}"
+
+    - name: Check maintenance mode lock
+      stat:
+        path: /var/lock/robot-maintenance
+      register: maintenance_lock
+
+    - name: Abort if robot is in maintenance
+      fail:
+        msg: "{{ inventory_hostname }} is in maintenance mode — deployment aborted"
+      when: maintenance_lock.stat.exists
+
+    # ---- Backup current state ------------------------------------------------
+
+    - name: Create deployment backup directory
+      file:
+        path: "/var/backups/robot-deployment/{{ ansible_date_time.iso8601_basic }}"
+        state: directory
+        mode: '0755'
+      register: backup_dir
+
+    - name: Snapshot current container state
+      shell: |
+        docker ps -a --format 'table {{ "{{.ID}}\t{{.Image}}\t{{.Status}}" }}' > {{ backup_dir.path }}/containers.txt
+        docker images --format 'table {{ "{{.Repository}}\t{{.Tag}}\t{{.ID}}" }}' > {{ backup_dir.path }}/images.txt
+      args:
+        executable: /bin/bash
+
+    - name: Record current running image
+      shell: docker ps --filter "name=robot-health" --format '{{ "{{.Image}}" }}'
+      register: current_image
+      changed_when: false
+
+    - name: Save rollback image tag
+      set_fact:
+        rollback_image: "{{ current_image.stdout }}"
+
+    # ---- Pull new image ------------------------------------------------------
+
+    - name: Log in to Docker registry
+      docker_login:
+        registry: "{{ docker_registry }}"
+        username: "{{ lookup('env', 'DOCKER_USERNAME') }}"
+        password: "{{ lookup('env', 'DOCKER_PASSWORD') }}"
+      no_log: true
+
+    - name: Pull new Docker image
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        force_source: true
+      register: image_pull
+      retries: 3
+      delay: 10
+
+    - name: Verify image pull succeeded
+      assert:
+        that:
+          - image_pull is succeeded
+        fail_msg: "Failed to pull {{ docker_image }}"
+
+    # ---- Deploy new version --------------------------------------------------
+
+    - name: Stop current containers
+      docker_container:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - robot-health-publisher
+        - robot-health-monitor
+      ignore_errors: true
+
+    - name: Remove old containers
+      docker_container:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - robot-health-publisher
+        - robot-health-monitor
+      ignore_errors: true
+
+    - name: Start health publisher
+      docker_container:
+        name: robot-health-publisher
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: unless-stopped
+        env:
+          ROS_DOMAIN_ID: "{{ ros_domain_id }}"
+          ROBOT_ID: "{{ robot_id }}"
+          ROBOT_LOCATION: "{{ site | default('unknown') }}"
+        command: ros2 run robot_health health_publisher
+        networks:
+          - name: robot-network
+      register: publisher_start
+
+    - name: Start health monitor
+      docker_container:
+        name: robot-health-monitor
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: unless-stopped
+        env:
+          ROS_DOMAIN_ID: "{{ ros_domain_id }}"
+        command: ros2 run robot_health health_monitor
+        networks:
+          - name: robot-network
+
+    # ---- Post-deployment validation ------------------------------------------
+
+    - name: Wait for containers to stabilise
+      pause:
+        seconds: 30
+
+    - name: Verify health publisher is running
+      docker_container_info:
+        name: robot-health-publisher
+      register: publisher_info
+
+    - name: Assert publisher is healthy
+      assert:
+        that:
+          - publisher_info.container.State.Running
+          - publisher_info.container.State.Status == 'running'
+        fail_msg: "Health publisher failed to start on {{ inventory_hostname }}"
+
+    - name: Verify health monitor is running
+      docker_container_info:
+        name: robot-health-monitor
+      register: monitor_info
+
+    - name: Assert monitor is healthy
+      assert:
+        that:
+          - monitor_info.container.State.Running
+          - monitor_info.container.State.Status == 'running'
+        fail_msg: "Health monitor failed to start on {{ inventory_hostname }}"
+
+    - name: Verify ROS2 node is registered
+      shell: docker exec robot-health-publisher ros2 node list | grep -q health_publisher
+      register: node_test
+      retries: 5
+      delay: 10
+      until: node_test.rc == 0
+
+    - name: Deployment successful
+      debug:
+        msg: "✓ {{ inventory_hostname }} — deployed {{ docker_image }}"
+
+  rescue:
+    # ---- Automatic rollback --------------------------------------------------
+
+    - name: Deployment failed — rolling back
+      debug:
+        msg: "✗ {{ inventory_hostname }} — rolling back to {{ rollback_image }}"
+
+    - name: Stop failed containers
+      docker_container:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - robot-health-publisher
+        - robot-health-monitor
+      ignore_errors: true
+
+    - name: Remove failed containers
+      docker_container:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - robot-health-publisher
+        - robot-health-monitor
+      ignore_errors: true
+
+    - name: Restart with rollback image
+      docker_container:
+        name: robot-health-publisher
+        image: "{{ rollback_image }}"
+        state: started
+        restart_policy: unless-stopped
+        env:
+          ROS_DOMAIN_ID: "{{ ros_domain_id }}"
+          ROBOT_ID: "{{ robot_id }}"
+        command: ros2 run robot_health health_publisher
+      when: rollback_enabled and rollback_image != ""
+
+    - name: Verify rollback
+      docker_container_info:
+        name: robot-health-publisher
+      register: rollback_check
+
+    - name: Rollback status
+      debug:
+        msg: "Rollback {{ 'successful' if rollback_check.container.State.Running else 'FAILED — manual intervention required' }}"
+
+    - name: Alert operations team
+      debug:
+        msg: "ALERT: Deployment failed on {{ inventory_hostname }}. Rollback complete."
+
+    - name: Fail the play
+      fail:
+        msg: "Deployment failed on {{ inventory_hostname }}"

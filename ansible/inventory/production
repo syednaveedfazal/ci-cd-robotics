@@ -1,0 +1,45 @@
+# Production Robot Fleet
+#
+# Robots grouped by customer site and deployment batch.
+# Batch groups allow gradual rollouts — deploy to batch_1 first, monitor, then expand.
+
+[production_robots]
+robot-alpha-001 ansible_host=10.50.1.10 ansible_user=robot robot_id=prod-alpha-001 site=power-plant-alpha location=germany
+robot-alpha-002 ansible_host=10.50.1.11 ansible_user=robot robot_id=prod-alpha-002 site=power-plant-alpha location=germany
+robot-beta-001  ansible_host=10.50.2.10 ansible_user=robot robot_id=prod-beta-001  site=wind-farm-beta  location=denmark
+robot-beta-002  ansible_host=10.50.2.11 ansible_user=robot robot_id=prod-beta-002  site=wind-farm-beta  location=denmark
+robot-gamma-001 ansible_host=10.50.3.10 ansible_user=robot robot_id=prod-gamma-001 site=oil-rig-gamma   location=norway
+
+[site_alpha]
+robot-alpha-001
+robot-alpha-002
+
+[site_beta]
+robot-beta-001
+robot-beta-002
+
+[site_gamma]
+robot-gamma-001
+
+[batch_1]
+robot-alpha-001
+
+[batch_2]
+robot-alpha-002
+robot-beta-001
+
+[batch_3]
+robot-beta-002
+robot-gamma-001
+
+[production_robots:vars]
+ansible_ssh_private_key_file=~/.ssh/robot_deploy_key_prod
+ansible_python_interpreter=/usr/bin/python3
+robot_environment=production
+ros_domain_id=0
+docker_registry=ghcr.io/your-org
+robot_network_interface=eth0
+robot_ros_distro=humble
+robot_firmware_version=2.1.0
+enable_monitoring=true
+prometheus_endpoint=monitoring.example.com:9090

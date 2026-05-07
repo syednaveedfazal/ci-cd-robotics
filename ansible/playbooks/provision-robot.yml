@@ -1,0 +1,264 @@
+---
+# Initial robot provisioning — run once when a robot is first deployed.
+# Configures network, SSH keys, Docker, ROS2, monitoring, and log collection.
+#
+# Usage:
+#   ansible-playbook -i inventory/production provision-robot.yml --limit robot-alpha-001
+
+- name: Initial Robot Provisioning
+  hosts: all
+  become: true
+  gather_facts: true
+  
+  vars:
+    ssh_public_keys:
+      - "ssh-rsa AAAAB3... deploy@your-org.com"   # Deployment key
+      - "ssh-rsa AAAAB4... ops@your-org.com"      # Ops team key
+  
+  tasks:
+    # ========================================================================
+    # SYSTEM CONFIGURATION
+    # ========================================================================
+    
+    - name: Set hostname to robot ID
+      hostname:
+        name: "{{ robot_id }}"
+    
+    - name: Update /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "127.0.1.1 {{ robot_id }}"
+        regexp: '^127\.0\.1\.1'
+    
+    - name: Update system packages
+      apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+    
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - python3
+          - python3-pip
+          - git
+          - curl
+          - wget
+          - net-tools
+          - htop
+          - vim
+        state: present
+    
+    # ========================================================================
+    # NETWORK CONFIGURATION
+    # ========================================================================
+    
+    - name: Configure network interface
+      template:
+        src: ../templates/netplan-config.yml.j2
+        dest: /etc/netplan/01-robot-network.yaml
+        mode: '0600'
+      notify: Apply netplan
+    
+    - name: Configure NetworkManager
+      copy:
+        dest: /etc/NetworkManager/conf.d/robot.conf
+        content: |
+          [main]
+          dns=systemd-resolved
+          [connection]
+          wifi.powersave=2
+        mode: '0644'
+      notify: Restart NetworkManager
+    
+    # ========================================================================
+    # SSH CONFIGURATION
+    # ========================================================================
+    
+    - name: Create robot user
+      user:
+        name: robot
+        groups: docker,sudo
+        shell: /bin/bash
+        create_home: true
+    
+    - name: Create .ssh directory for robot user
+      file:
+        path: /home/robot/.ssh
+        state: directory
+        owner: robot
+        group: robot
+        mode: '0700'
+
+    - name: Set up authorized keys for robot user
+      lineinfile:
+        path: /home/robot/.ssh/authorized_keys
+        line: "{{ item }}"
+        create: true
+        owner: robot
+        group: robot
+        mode: '0600'
+      loop: "{{ ssh_public_keys }}"
+    
+    - name: Configure SSH for key-only authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+      notify: Restart SSH
+    
+    # ========================================================================
+    # DOCKER CONFIGURATION
+    # ========================================================================
+    
+    - name: Add robot user to docker group
+      user:
+        name: robot
+        groups: docker
+        append: true
+    
+    - name: Configure Docker daemon
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "5"
+            },
+            "storage-driver": "overlay2"
+          }
+        mode: '0644'
+      notify: Restart Docker
+    
+    - name: Enable Docker service
+      systemd:
+        name: docker
+        enabled: true
+        state: started
+    
+    # ========================================================================
+    # ROS2 ENVIRONMENT SETUP
+    # ========================================================================
+    
+    - name: Add ROS2 apt repository key
+      apt_key:
+        url: https://raw.githubusercontent.com/ros/rosdistro/master/ros.key
+        state: present
+    
+    - name: Add ROS2 apt repository
+      apt_repository:
+        repo: "deb http://packages.ros.org/ros2/ubuntu {{ ansible_distribution_release }} main"
+        state: present
+    
+    - name: Install ROS2 Humble (base)
+      apt:
+        name: ros-humble-ros-base
+        state: present
+        update_cache: true
+    
+    - name: Create ROS2 workspace
+      file:
+        path: /home/robot/ros2_ws
+        state: directory
+        owner: robot
+        group: robot
+        mode: '0755'
+    
+    - name: Add ROS2 sourcing to bashrc
+      lineinfile:
+        path: /home/robot/.bashrc
+        line: "source /opt/ros/humble/setup.bash"
+        create: true
+    
+    # ========================================================================
+    # MONITORING SETUP
+    # ========================================================================
+    
+    - name: Install Prometheus node exporter
+      apt:
+        name: prometheus-node-exporter
+        state: present
+      when: enable_monitoring | default(false)
+    
+    - name: Configure node exporter
+      systemd:
+        name: prometheus-node-exporter
+        enabled: true
+        state: started
+      when: enable_monitoring | default(false)
+    
+    # ========================================================================
+    # LOG COLLECTION
+    # ========================================================================
+    
+    - name: Create log directory
+      file:
+        path: /var/log/robot
+        state: directory
+        mode: '0755'
+    
+    - name: Configure journald
+      lineinfile:
+        path: /etc/systemd/journald.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?Storage', line: 'Storage=persistent' }
+        - { regexp: '^#?MaxRetentionSec', line: 'MaxRetentionSec=2week' }
+      notify: Restart journald
+    
+    # ========================================================================
+    # VALIDATION
+    # ========================================================================
+    
+    - name: Run validation tests
+      block:
+        - name: Test Docker
+          command: docker run --rm hello-world
+          register: docker_test
+          changed_when: false
+        
+        - name: Test network connectivity
+          command: ping -c 3 8.8.8.8
+          register: network_test
+          changed_when: false
+        
+        - name: Provisioning successful
+          debug:
+            msg: "✓ Robot {{ robot_id }} provisioned successfully at {{ site }}"
+  
+  # ========================================================================
+  # HANDLERS
+  # ========================================================================
+  
+  handlers:
+    - name: Apply netplan
+      command: netplan apply
+    
+    - name: Restart NetworkManager
+      systemd:
+        name: NetworkManager
+        state: restarted
+    
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
+    
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted
+    
+    - name: Restart journald
+      systemd:
+        name: systemd-journald
+        state: restarted

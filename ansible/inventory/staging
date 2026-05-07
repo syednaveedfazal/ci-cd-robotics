@@ -1,0 +1,17 @@
+# Staging Robot Fleet
+#
+# Robots used for testing and canary deployments before production rollout.
+
+[staging_robots]
+staging-robot-1 ansible_host=192.168.1.101 ansible_user=robot robot_id=staging-001
+staging-robot-2 ansible_host=192.168.1.102 ansible_user=robot robot_id=staging-002
+
+[staging_robots:vars]
+ansible_ssh_private_key_file=~/.ssh/robot_deploy_key
+ansible_python_interpreter=/usr/bin/python3
+robot_environment=staging
+ros_domain_id=0
+docker_registry=ghcr.io/your-org
+robot_network_interface=eth0
+robot_ros_distro=humble
+robot_firmware_version=2.1.0

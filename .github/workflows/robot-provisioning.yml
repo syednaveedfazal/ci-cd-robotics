@@ -1,0 +1,214 @@
+name: Robot Provisioning CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/robot-fleet
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Build and test the ROS2 package
+  # --------------------------------------------------------------------------
+  build-and-test:
+    name: Build and Test ROS2 Package
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up ROS2 Humble
+        uses: ros-tooling/setup-ros@v0.6
+        with:
+          required-ros-distributions: humble
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-pytest
+          pip3 install pytest
+
+      - name: Build ROS2 workspace
+        shell: bash
+        run: |
+          cd ros2_ws
+          source /opt/ros/humble/setup.bash
+          colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: Run tests
+        shell: bash
+        run: |
+          cd ros2_ws
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          colcon test
+          colcon test-result --verbose
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: ros2_ws/log/latest_test/
+
+  # --------------------------------------------------------------------------
+  # 2. Build Docker image (only if tests pass)
+  # --------------------------------------------------------------------------
+  build-docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy-results.sarif
+
+  # --------------------------------------------------------------------------
+  # 3. Deploy to staging (canary — 1 robot)
+  # --------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-22.04
+    needs: build-docker
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.robot-fleet.example.com
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy to staging robot
+        run: |
+          echo "Deploying ${{ github.sha }} to staging-robot-1..."
+          # ansible-playbook -i ansible/inventory/staging \
+          #   ansible/playbooks/deploy-robot.yml \
+          #   --extra-vars "image_tag=${{ github.sha }}" \
+          #   --limit staging-robot-1
+
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests on staging..."
+          # ros2 topic echo /robot_health --once
+          # Check mission execution, sensor calibration
+
+      - name: Health check (60s stabilisation window)
+        run: |
+          sleep 60
+          echo "Staging health check passed"
+
+  # --------------------------------------------------------------------------
+  # 4. Deploy to production — gradual rollout in 3 batches
+  # --------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production (Batch ${{ matrix.batch }})
+    runs-on: ubuntu-22.04
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://fleet.robot-fleet.example.com
+    strategy:
+      matrix:
+        batch: [1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy batch ${{ matrix.batch }}
+        run: |
+          echo "Deploying to production batch ${{ matrix.batch }}..."
+          # Batch 1: 20% (canary)
+          # Batch 2: 40%
+          # Batch 3: 40% (remaining)
+          #
+          # ansible-playbook -i ansible/inventory/production \
+          #   ansible/playbooks/deploy-robot.yml \
+          #   --extra-vars "image_tag=${{ github.sha }}" \
+          #   --limit batch_${{ matrix.batch }}
+
+      - name: Monitor batch ${{ matrix.batch }}
+        run: |
+          echo "Monitoring batch ${{ matrix.batch }}..."
+          # Check Grafana for error rate, battery drain, mission success rate
+
+      - name: Approval checkpoint
+        if: matrix.batch < 3
+        run: echo "Batch ${{ matrix.batch }} healthy — proceeding to next batch"
+
+  # --------------------------------------------------------------------------
+  # 5. Rollback on failure
+  # --------------------------------------------------------------------------
+  rollback:
+    name: Emergency Rollback
+    runs-on: ubuntu-22.04
+    if: failure()
+    needs: [deploy-staging, deploy-production]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Rollback fleet to previous image
+        run: |
+          echo "ROLLBACK TRIGGERED — reverting to previous known-good image"
+          # PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^)
+          # ansible-playbook -i ansible/inventory/production \
+          #   ansible/playbooks/deploy-robot.yml \
+          #   --extra-vars "image_tag=${PREVIOUS_TAG}"
+
+      - name: Notify team
+        run: |
+          echo "Sending alert to on-call team..."
+          # curl -X POST ${{ secrets.SLACK_WEBHOOK }} -d '{"text":"Deployment failed — rollback complete"}'

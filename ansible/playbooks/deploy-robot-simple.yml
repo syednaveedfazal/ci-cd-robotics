@@ -1,0 +1,71 @@
+---
+# Simplified deployment playbook for local demo and dry-run testing.
+# Uses debug modules instead of real Docker modules so it runs without
+# actual robots — use deploy-robot.yml for production.
+#
+# Usage:
+#   ansible-playbook -i inventory/local deploy-robot-simple.yml --check
+#   ansible-playbook -i inventory/local deploy-robot-simple.yml --extra-vars "image_tag=v1.2.0"
+
+- name: Deploy Robot Software Update
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    image_tag: "latest"
+    docker_image: "{{ docker_registry }}/robot-fleet:{{ image_tag }}"
+    rollback_enabled: true
+
+  tasks:
+    # ---- Pre-deployment checks -----------------------------------------------
+
+    - name: Check robot connectivity
+      ping:
+      register: ping_result
+
+    - name: Check disk space (minimum 5GB free)
+      shell: df -BG / | awk 'NR==2 {print $4}' | sed 's/G//'
+      register: disk_space
+      changed_when: false
+
+    - name: Verify sufficient disk space
+      assert:
+        that:
+          - disk_space.stdout|default('100')|int > 5
+        fail_msg: "Insufficient disk space on {{ inventory_hostname }}"
+        success_msg: "Disk space check passed"
+      when: disk_space.stdout is defined and disk_space.stdout != ""
+
+    # ---- Deployment ----------------------------------------------------------
+
+    - name: Display deployment info
+      debug:
+        msg: "Deploying {{ docker_image }} to {{ inventory_hostname }}"
+
+    - name: Pull Docker image
+      debug:
+        msg: "Would pull {{ docker_image }}"
+
+    - name: Stop current containers
+      debug:
+        msg: "Would stop robot containers"
+
+    - name: Start updated containers
+      debug:
+        msg: "Would start robot containers with new image"
+
+    - name: Wait for containers to stabilise
+      pause:
+        seconds: 5
+      when: not ansible_check_mode
+
+    # ---- Post-deployment validation ------------------------------------------
+
+    - name: Verify deployment
+      debug:
+        msg: "Deployment validation passed"
+
+    - name: Deployment successful
+      debug:
+        msg: "✓ Deployment successful on {{ inventory_hostname }}"
